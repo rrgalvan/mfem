@@ -20,6 +20,91 @@
 namespace mfem {
   std::map<occa::hash_t, OccaDofQuadMaps> OccaDofQuadMaps::AllDofQuadMaps;
 
+  OccaGeometry OccaGeometry::Get(occa::device device,
+                                 Mesh &mesh,
+                                 const IntegrationRule &ir,
+                                 const int flags) {
+
+    OccaGeometry geom;
+    if (!mesh.GetNodes()) {
+      mesh.SetCurvature(1, false, -1, Ordering::byVDIM);
+    }
+    GridFunction &nodes = *(mesh.GetNodes());
+    const FiniteElementSpace &fespace = *(nodes.FESpace());
+    const FiniteElement &fe = *(fespace.GetFE(0));
+
+    const int dims     = fe.GetDim();
+    const int elements = fespace.GetNE();
+    const int numDofs  = fe.GetDof();
+    const int numQuad  = ir.GetNPoints();
+
+    Ordering::Type originalOrdering = fespace.GetOrdering();
+    nodes.ReorderByVDim();
+    geom.meshNodes.allocate(device,
+                            dims, numDofs, elements);
+
+    const Table &e2dTable = fespace.GetElementToDofTable();
+    const int *elementMap = e2dTable.GetJ();
+    for (int e = 0; e < elements; ++e) {
+      for (int d = 0; d < numDofs; ++d) {
+        const int gid = elementMap[d + numDofs*e];
+        for (int dim = 0; dim < dims; ++dim) {
+          geom.meshNodes(dim, d, e) = nodes[dim + gid*dims];
+        }
+      }
+    }
+    geom.meshNodes.keepInDevice();
+
+    // Reorder the original gf back
+    if (originalOrdering == Ordering::byNODES) {
+      nodes.ReorderByNodes();
+    } else {
+      nodes.ReorderByVDim();
+    }
+
+    if (flags & Jacobian) {
+      geom.J.allocate(device,
+                      dims*dims, numQuad, elements);
+    } else {
+      geom.J.allocate(device, 1);
+    }
+    if (flags & JacobianInv) {
+      geom.invJ.allocate(device,
+                         dims*dims, numQuad, elements);
+    } else {
+      geom.invJ.allocate(device, 1);
+    }
+    if (flags & JacobianDet) {
+      geom.detJ.allocate(device,
+                         numQuad, elements);
+    } else {
+      geom.detJ.allocate(device, 1);
+    }
+
+    geom.J.stopManaging();
+    geom.invJ.stopManaging();
+    geom.detJ.stopManaging();
+
+    OccaDofQuadMaps &maps = OccaDofQuadMaps::GetSimplexMaps(device, fe, ir);
+
+    occa::properties props;
+    props["defines/NUM_DOFS"] = numDofs;
+    props["defines/NUM_QUAD"] = numQuad;
+    props["defines/STORE_JACOBIAN"]     = (flags & Jacobian);
+    props["defines/STORE_JACOBIAN_INV"] = (flags & JacobianInv);
+    props["defines/STORE_JACOBIAN_DET"] = (flags & JacobianDet);
+
+    occa::kernel init = device.buildKernel("occa://mfem/fem/geometry.okl",
+                                           stringWithDim("InitGeometryInfo", fe.GetDim()),
+                                           props);
+    init(elements,
+         maps.dofToQuadD,
+         geom.meshNodes,
+         geom.J, geom.invJ, geom.detJ);
+
+    return geom;
+  }
+
   OccaDofQuadMaps::OccaDofQuadMaps() :
     hash() {}
 
@@ -58,6 +143,7 @@ namespace mfem {
 
     const Poly_1D::Basis &basis = fe.GetBasis();
     const int order = fe.GetOrder();
+    // [MISSING] Get 1D dofs
     const int dofs = order + 1;
     const int dims = fe.GetDim();
 
@@ -84,9 +170,9 @@ namespace mfem {
                               quadPointsND);
     double *quadWeights1DData = new double[quadPoints];
 
+    mfem::Vector d2q(dofs);
+    mfem::Vector d2qD(dofs);
     for (int q = 0; q < quadPoints; ++q) {
-      mfem::Vector d2q(dofs);
-      mfem::Vector d2qD(dofs);
       const IntegrationPoint &ip = ir1D.IntPoint(q);
       basis.Eval(ip.x, d2q, d2qD);
       quadWeights1DData[q] = ip.weight;
@@ -157,9 +243,9 @@ namespace mfem {
     maps.quadWeights.allocate(device,
                               numQuad);
 
+    Vector d2q(numDofs);
+    DenseMatrix d2qD(numDofs, dims);
     for (int q = 0; q < numQuad; ++q) {
-      mfem::Vector d2q;
-      mfem::DenseMatrix d2qD;
       const IntegrationPoint &ip = ir.IntPoint(q);
       maps.quadWeights[q] = ip.weight;
       fe.CalcShape(ip, d2q);
@@ -278,153 +364,22 @@ namespace mfem {
     props["defines/M3_INNER_BATCH"]   = closestWarpBatchTo(maxDQ);
   }
 
-  occa::array<double> getJacobian(occa::device device,
-                                  FiniteElementSpace *fespace,
-                                  const IntegrationRule &ir) {
-    const FiniteElement &fe = *(fespace->GetFE(0));
-
-    const int dims = fe.GetDim();
-    const int elements = fespace->GetNE();
-    const int quadraturePoints = ir.GetNPoints();
-
-    const int dims2 = dims * dims;
-    const int jacobianEntries = elements * quadraturePoints * dims2;
-
-    occa::array<double> jacobian(dims2, quadraturePoints, elements);
-    double *eJacobian = jacobian.data();
-
-    Mesh &mesh = *(fespace->GetMesh());
-    for (int e = 0; e < elements; ++e) {
-      ElementTransformation &trans = *(mesh.GetElementTransformation(e));
-      for (int q = 0; q < quadraturePoints; ++q) {
-        const IntegrationPoint &ip = ir.IntPoint(q);
-        trans.SetIntPoint(&ip);
-        const DenseMatrix &qJ = trans.Jacobian();
-        for (int j = 0; j < dims; ++j) {
-          for (int i = 0; i < dims; ++i) {
-            // Column-major -> Row-major
-            eJacobian[j + i*dims] = qJ(i,j);
-          }
-        }
-        eJacobian += dims2;
-      }
-    }
-
-    jacobian.keepInDevice();
-
-    return jacobian;
-  }
-
-
-  void getJacobianData(occa::device device,
-                       FiniteElementSpace *fespace,
-                       const IntegrationRule &ir,
-                       occa::array<double> &J,
-                       occa::array<double> &Jinv,
-                       occa::array<double> &Jdet)
-  {
-    const FiniteElement &fe = *(fespace->GetFE(0));
-
-    const int dims = fe.GetDim();
-    const int elements = fespace->GetNE();
-    const int quadraturePoints = ir.GetNPoints();
-
-    const int dims2 = dims * dims;
-    const int jacobianEntries = elements * quadraturePoints * dims2;
-
-    J.allocate(dims2, quadraturePoints, elements);
-    Jinv.allocate(dims2, quadraturePoints, elements);
-    Jdet.allocate(quadraturePoints, elements);
-    double *eJ = J.data();
-    double *eJinv = J.data();
-    double *eJdet = J.data();
-
-    Mesh &mesh = *(fespace->GetMesh());
-    for (int e = 0; e < elements; ++e) {
-      ElementTransformation &trans = *(mesh.GetElementTransformation(e));
-      for (int q = 0; q < quadraturePoints; ++q) {
-        const IntegrationPoint &ip = ir.IntPoint(q);
-        trans.SetIntPoint(&ip);
-        const DenseMatrix &qJ = trans.Jacobian();
-        DenseMatrix qJinv(dims);
-        CalcInverse(qJ, qJinv);
-        for (int j = 0; j < dims; ++j) {
-          for (int i = 0; i < dims; ++i) {
-            // Column-major -> Row-major
-            eJ[j + i*dims] = qJ(i,j);
-            eJinv[j + i*dims] = qJinv(i,j);
-          }
-        }
-        *eJdet = qJ.Det();
-
-        eJ += dims2;
-        eJinv += dims2;
-        eJdet += 1;
-      }
-    }
-
-    J.keepInDevice();
-    Jinv.keepInDevice();
-    Jdet.keepInDevice();
-  } 
-
-
   //---[ Base Integrator ]--------------
   OccaIntegrator::OccaIntegrator() {}
   OccaIntegrator::~OccaIntegrator() {}
 
-  OccaIntegrator* OccaIntegrator::CreateInstance(occa::device device_,
-                                                 BilinearFormIntegrator *integrator_,
-                                                 FiniteElementSpace *fespace_,
-                                                 const occa::properties &props_,
-                                                 const OccaIntegratorType itype_) {
-    OccaIntegrator *newIntegrator = CreateInstance();
+  void OccaIntegrator::SetupIntegrator(OccaBilinearForm &bform_,
+                                       const occa::properties &props_,
+                                       const OccaIntegratorType itype_) {
+    device  = bform_.device;
+    bform   = &bform_;
+    fespace = &(bform_.GetFESpace());
+    mesh    = &(bform_.GetMesh());
 
-    newIntegrator->device = device_;
-    newIntegrator->integrator = integrator_;
-    newIntegrator->fespace = fespace_;
-    newIntegrator->props = props_;
-    newIntegrator->itype = itype_;
+    props = props_;
+    itype = itype_;
 
-    newIntegrator->Setup();
-
-    return newIntegrator;
-  }
-
-  std::string OccaIntegrator::GetName() {
-    return integrator->Name();
-  }
-
-  void OccaIntegrator::Setup() {}
-
-  void OccaIntegrator::SetupCoefficient(const Coefficient *coeff,
-                                        occa::properties &kernelProps) {
-
-    if (dynamic_cast<const ConstantCoefficient*>(coeff)) {
-      const ConstantCoefficient* c =
-        dynamic_cast<const ConstantCoefficient*>(coeff);
-      kernelProps["defines/COEFF_ARGS"] = "";
-      kernelProps["defines/COEFF"]      = c->constant;
-    } else if (dynamic_cast<const GridFunctionCoefficient*>(coeff)) {
-      kernelProps["headers"].asArray();
-      kernelProps["headers"] += ("double gridFunctionCoeff(const int e,\n"
-                                 "                         const int q,\n"
-                                 "                         const DofToQuad_t restrict dofToQuad,\n"
-                                 "                         Local_t restrict gfValues) {\n"
-                                 "  double c = 0;\n"
-                                 "  for (int d = 0; d < NUM_DOFS; ++d) {\n"
-                                 "    c += dofToQuad(q, d) * values(d, e);\n"
-                                 "  }\n"
-                                 "  return c;\n"
-                                 "}\n\n");
-      kernelProps["defines/COEFF_ARGS"] = ("const DofToQuad_t restrict dofToQuad,\n"
-                                           "Local_t restrict gfValues,\n");
-      kernelProps["defines/COEFF"]      = "gridFunctionCoeff(e, q, dofToQuad, gfValues)";
-    } else {
-      mfem_error("OccaIntegrator can only handle:\n"
-                 "  - ConstantCoefficient\n"
-                 "  - GridFunctionCoefficient\n");
-    }
+    Setup();
   }
 
   occa::kernel OccaIntegrator::GetAssembleKernel(const occa::properties &props) {
@@ -449,24 +404,22 @@ namespace mfem {
   //====================================
 
   //---[ Diffusion Integrator ]---------
-  OccaDiffusionIntegrator::OccaDiffusionIntegrator() :
-    OccaIntegrator() {}
+  OccaDiffusionIntegrator::OccaDiffusionIntegrator(const OccaCoefficient &coeff_) :
+    coeff(coeff_) {
+    coeff.SetName("COEFF");
+  }
 
   OccaDiffusionIntegrator::~OccaDiffusionIntegrator() {}
 
-  OccaIntegrator* OccaDiffusionIntegrator::CreateInstance() {
-    return new OccaDiffusionIntegrator();
+  std::string OccaDiffusionIntegrator::GetName() {
+    return "DiffusionIntegrator";
   }
 
   void OccaDiffusionIntegrator::Setup() {
     occa::properties kernelProps = props;
 
-    DiffusionIntegrator &integ = (DiffusionIntegrator&) *integrator;
-    coeff = integ.GetCoefficient();
-    SetupCoefficient(coeff, kernelProps);
-
     const FiniteElement &fe   = *(fespace->GetFE(0));
-    const IntegrationRule &ir = integ.GetIntegrationRule(fe, fe);
+    const IntegrationRule &ir = GetDiffusionIntegrationRule(fe, fe);
 
     const H1_TensorBasisElement *el = dynamic_cast<const H1_TensorBasisElement*>(&fe);
     if (el) {
@@ -485,7 +438,12 @@ namespace mfem {
 
     assembledOperator.allocate(symmDims, quadraturePoints, elements);
 
-    jacobian = getJacobian(device, fespace, ir);
+    OccaGeometry geom = OccaGeometry::Get(device,
+                                          *mesh, ir,
+                                          OccaGeometry::Jacobian);
+    jacobian = geom.J;
+
+    coeff.SetProps(kernelProps);
 
     // Setup assemble and mult kernels
     assembleKernel = GetAssembleKernel(kernelProps);
@@ -493,51 +451,41 @@ namespace mfem {
   }
 
   void OccaDiffusionIntegrator::Assemble() {
-    if (dynamic_cast<const ConstantCoefficient*>(coeff)) {
-      assembleKernel((int) fespace->GetNE(),
-                     maps.quadWeights.memory(),
-                     jacobian.memory(),
-                     assembledOperator.memory());
-    } else if (dynamic_cast<const GridFunctionCoefficient*>(coeff)) {
-      assembleKernel((int) fespace->GetNE(),
-                     maps.quadWeights.memory(),
-                     jacobian.memory(),
-                     maps.dofToQuad.memory(),
-                     // GF vector
-                     assembledOperator.memory());
-    }
+    assembleKernel((int) fespace->GetNE(),
+                   maps.quadWeights,
+                   jacobian,
+                   coeff,
+                   assembledOperator);
   }
 
   void OccaDiffusionIntegrator::Mult(OccaVector &x) {
     multKernel((int) fespace->GetNE(),
-               maps.dofToQuad.memory(),
-               maps.dofToQuadD.memory(),
-               maps.quadToDof.memory(),
-               maps.quadToDofD.memory(),
-               assembledOperator.memory(),
+               maps.dofToQuad,
+               maps.dofToQuadD,
+               maps.quadToDof,
+               maps.quadToDofD,
+               assembledOperator,
                x);
   }
   //====================================
 
   //---[ Mass Integrator ]--------------
-  OccaMassIntegrator::OccaMassIntegrator() :
-    OccaIntegrator() {}
+  OccaMassIntegrator::OccaMassIntegrator(const OccaCoefficient &coeff_) :
+    coeff(coeff_) {
+    coeff.SetName("COEFF");
+  }
 
   OccaMassIntegrator::~OccaMassIntegrator() {}
 
-  OccaIntegrator* OccaMassIntegrator::CreateInstance() {
-    return new OccaMassIntegrator();
+  std::string OccaMassIntegrator::GetName() {
+    return "MassIntegrator";
   }
 
   void OccaMassIntegrator::Setup() {
     occa::properties kernelProps = props;
 
-    MassIntegrator &integ = (MassIntegrator&) *integrator;
-    coeff = integ.GetCoefficient();
-    SetupCoefficient(coeff, kernelProps);
-
     const FiniteElement &fe   = *(fespace->GetFE(0));
-    const IntegrationRule &ir = integ.GetIntegrationRule(fe, fe);
+    const IntegrationRule &ir = GetMassIntegrationRule(fe, fe);
 
     const H1_TensorBasisElement *el = dynamic_cast<const H1_TensorBasisElement*>(&fe);
     if (el) {
@@ -553,7 +501,12 @@ namespace mfem {
 
     assembledOperator.allocate(quadraturePoints, elements);
 
-    jacobian = getJacobian(device, fespace, ir);
+    OccaGeometry geom = OccaGeometry::Get(device,
+                                          *mesh, ir,
+                                          OccaGeometry::Jacobian);
+    jacobian = geom.J;
+
+    coeff.SetProps(kernelProps);
 
     // Setup assemble and mult kernels
     assembleKernel = GetAssembleKernel(kernelProps);
@@ -561,28 +514,20 @@ namespace mfem {
   }
 
   void OccaMassIntegrator::Assemble() {
-    if (dynamic_cast<const ConstantCoefficient*>(coeff)) {
-      assembleKernel((int) fespace->GetNE(),
-                     maps.quadWeights.memory(),
-                     jacobian.memory(),
-                     assembledOperator.memory());
-    } else if (dynamic_cast<const GridFunctionCoefficient*>(coeff)) {
-      assembleKernel((int) fespace->GetNE(),
-                     maps.quadWeights.memory(),
-                     jacobian.memory(),
-                     maps.dofToQuad.memory(),
-                     // GF vector
-                     assembledOperator.memory());
-    }
+    assembleKernel((int) fespace->GetNE(),
+                   maps.quadWeights,
+                   jacobian,
+                   coeff,
+                   assembledOperator);
   }
 
   void OccaMassIntegrator::Mult(OccaVector &x) {
     multKernel((int) fespace->GetNE(),
-               maps.dofToQuad.memory(),
-               maps.dofToQuadD.memory(),
-               maps.quadToDof.memory(),
-               maps.quadToDofD.memory(),
-               assembledOperator.memory(),
+               maps.dofToQuad,
+               maps.dofToQuadD,
+               maps.quadToDof,
+               maps.quadToDofD,
+               assembledOperator,
                x);
   }
   //====================================

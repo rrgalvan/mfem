@@ -15,129 +15,33 @@
 
 #include "obilinearform.hpp"
 #include "obilininteg.hpp"
-#include "ointerpolation.hpp"
 #include "../linalg/osparsemat.hpp"
 
 #include "tfe.hpp"
 
 namespace mfem {
   //---[ Bilinear Form ]----------------
-  OccaBilinearForm::IntegratorBuilderMap OccaBilinearForm::integratorBuilders;
-
-  OccaBilinearForm::OccaBilinearForm(FiniteElementSpace *fespace_) :
-    Operator(fespace_->GetVSize()) {
-    Init(occa::currentDevice(), fespace_);
+  OccaBilinearForm::OccaBilinearForm(OccaFiniteElementSpace *ofespace_) :
+    Operator(ofespace_->GetFESpace()->GetVSize()) {
+    Init(occa::currentDevice(), ofespace_);
   }
 
-  OccaBilinearForm::OccaBilinearForm(occa::device device_, FiniteElementSpace *fespace_) :
-    Operator(fespace_->GetVSize()) {
-    Init(device, fespace_);
+  OccaBilinearForm::OccaBilinearForm(occa::device device_,
+                                     OccaFiniteElementSpace *ofespace_) :
+    Operator(ofespace_->GetFESpace()->GetVSize()) {
+    Init(device, ofespace_);
   }
 
-  void OccaBilinearForm::Init(occa::device device_, FiniteElementSpace *fespace_) {
-    fespace = fespace_;
+  void OccaBilinearForm::Init(occa::device device_, OccaFiniteElementSpace *ofespace_) {
+    ofespace = ofespace_;
+    fespace = ofespace_->GetFESpace();
     mesh = fespace->GetMesh();
     device = device_;
 
-    SetupIntegratorBuilderMap();
-    SetupKernels();
-    SetupIntegratorData();
-    SetupInterpolationData();
-  }
+    baseKernelProps["defines/NUM_VDIM"] = fespace->GetVDim();
 
-  void OccaBilinearForm::SetupIntegratorBuilderMap() {
-    if (0 < integratorBuilders.size()) {
-      return;
-    }
-    integratorBuilders[DiffusionIntegrator::StaticName()] =
-      new OccaDiffusionIntegrator();
-    integratorBuilders[MassIntegrator::StaticName()] =
-      new OccaMassIntegrator();
-  }
-
-  void OccaBilinearForm::SetupKernels() {
-    baseKernelProps["defines/NUM_VDIM"] = GetVDim();
-
-    occa::properties mapProps("defines: {"
-                              "  TILESIZE: 256,"
-                              "}");
-
-    vectorExtractKernel = device.buildKernel("occa://mfem/linalg/mappings.okl",
-                                             "VectorExtract",
-                                             mapProps);
-    vectorAssembleKernel = device.buildKernel("occa://mfem/linalg/mappings.okl",
-                                              "VectorAssemble",
-                                              mapProps);
-  }
-
-  void OccaBilinearForm::SetupIntegratorData() {
-    const FiniteElement &fe = GetFE(0);
-    const H1_TensorBasisElement *el = dynamic_cast<const H1_TensorBasisElement*>(&fe);
-
-    const Table &e2dTable = fespace->GetElementToDofTable();
-    const int *elementMap = e2dTable.GetJ();
     const int elements = GetNE();
-    const int numDofs = GetNDofs();
-    const int localDofs = fe.GetDof();
-
-    const int *dofMap;
-    if (el) {
-      dofMap = el->GetDofMap().GetData();
-    } else {
-      int *dofMap_ = new int[localDofs];
-      for (int i = 0; i < localDofs; ++i) {
-        dofMap_[i] = i;
-      }
-      dofMap = dofMap_;
-    }
-
-    // Allocate device offsets and indices
-    globalToLocalOffsets.allocate(device,
-                                  numDofs + 1);
-    globalToLocalIndices.allocate(device,
-                                  localDofs, elements);
-
-    int *offsets = globalToLocalOffsets.data();
-    int *indices = globalToLocalIndices.data();
-
-    // We'll be keeping a count of how many local nodes point
-    //   to its global dof
-    for (int i = 0; i <= numDofs; ++i) {
-      offsets[i] = 0;
-    }
-
-    for (int e = 0; e < elements; ++e) {
-      for (int d = 0; d < localDofs; ++d) {
-        const int gid = elementMap[localDofs*e + d];
-        ++offsets[gid + 1];
-      }
-    }
-    // Aggregate to find offsets for each global dof
-    for (int i = 1; i <= numDofs; ++i) {
-      offsets[i] += offsets[i - 1];
-    }
-    // For each global dof, fill in all local nodes that point
-    //   to it
-    for (int e = 0; e < elements; ++e) {
-      for (int d = 0; d < localDofs; ++d) {
-        const int gid = elementMap[localDofs*e + dofMap[d]];
-        const int lid = localDofs*e + d;
-        indices[offsets[gid]++] = lid;
-      }
-    }
-    // We shifted the offsets vector by 1 by using it
-    //   as a counter. Now we shift it back.
-    for (int i = numDofs; i > 0; --i) {
-      offsets[i] = offsets[i - 1];
-    }
-    offsets[0] = 0;
-
-    globalToLocalOffsets.keepInDevice();
-    globalToLocalIndices.keepInDevice();
-
-    if (!el) {
-      delete [] dofMap;
-    }
+    const int localDofs = ofespace->GetLocalDofs();
 
     // Allocate a temporary vector where local element operations
     //   will be handled.
@@ -154,21 +58,20 @@ namespace mfem {
     }
   }
 
-  void OccaBilinearForm::SetupInterpolationData() {
-    const SparseMatrix *R = fespace->GetRestrictionMatrix();
-    const Operator *P = fespace->GetProlongationMatrix();
-    CreateRPOperators(device,
-                      R, P,
-                      restrictionOp,
-                      prolongationOp);
-  }
-
   occa::device OccaBilinearForm::GetDevice() {
     return device;
   }
 
   int OccaBilinearForm::BaseGeom() const {
     return mesh->GetElementBaseGeometry();
+  }
+
+  FiniteElementSpace& OccaBilinearForm::GetFESpace() const {
+    return *fespace;
+  }
+
+  OccaFiniteElementSpace& OccaBilinearForm::GetOccaFESpace() const {
+    return *ofespace;
   }
 
   Mesh& OccaBilinearForm::GetMesh() const {
@@ -189,30 +92,6 @@ namespace mfem {
 
   const FiniteElement& OccaBilinearForm::GetFE(const int i) const {
     return *(fespace->GetFE(i));
-  }
-
-  // Adds new Domain Integrator.
-  void OccaBilinearForm::AddDomainIntegrator(BilinearFormIntegrator *integrator,
-                                             const occa::properties &props) {
-    AddIntegrator(integrator, props, DomainIntegrator);
-  }
-
-  // Adds new Boundary Integrator.
-  void OccaBilinearForm::AddBoundaryIntegrator(BilinearFormIntegrator *integrator,
-                                               const occa::properties &props) {
-    AddIntegrator(integrator, props, BoundaryIntegrator);
-  }
-
-  // Adds new interior Face Integrator.
-  void OccaBilinearForm::AddInteriorFaceIntegrator(BilinearFormIntegrator *integrator,
-                                                   const occa::properties &props) {
-    AddIntegrator(integrator, props, InteriorFaceIntegrator);
-  }
-
-  // Adds new boundary Face Integrator.
-  void OccaBilinearForm::AddBoundaryFaceIntegrator(BilinearFormIntegrator *integrator,
-                                                   const occa::properties &props) {
-    AddIntegrator(integrator, props, BoundaryFaceIntegrator);
   }
 
   // Adds new Domain Integrator.
@@ -240,26 +119,7 @@ namespace mfem {
   }
 
   // Adds Integrator based on OccaIntegratorType
-  void OccaBilinearForm::AddIntegrator(BilinearFormIntegrator *integrator,
-                                       const occa::properties &props,
-                                       const OccaIntegratorType itype) {
-    AddIntegrator(integrator,
-                  integratorBuilders[integrator->Name()],
-                  props, itype);
-  }
-
-  // Adds Integrator based on OccaIntegratorType
   void OccaBilinearForm::AddIntegrator(OccaIntegrator *integrator,
-                                       const occa::properties &props,
-                                       const OccaIntegratorType itype) {
-    AddIntegrator(NULL,
-                  integrator,
-                  props, itype);
-  }
-
-  // Adds Integrator based on OccaIntegratorType
-  void OccaBilinearForm::AddIntegrator(BilinearFormIntegrator *bIntegrator,
-                                       OccaIntegrator *integrator,
                                        const occa::properties &props,
                                        const OccaIntegratorType itype) {
     if (integrator == NULL) {
@@ -271,52 +131,24 @@ namespace mfem {
       case InteriorFaceIntegrator: error_ss << "AddInteriorFaceIntegrator"; break;
       case BoundaryFaceIntegrator: error_ss << "AddBoundaryFaceIntegrator"; break;
       }
-      if (bIntegrator) {
-        error_ss << " (...):\n"
-                 << "  No kernel builder for occa::BilinearFormIntegrator '"
-                 << bIntegrator->Name() << "'";
-      } else {
-        error_ss << " (...):\n"
-                 << "  Integrator is NULL";
-      }
+
+      error_ss << " (...):\n"
+               << "  Integrator is NULL";
       const std::string error = error_ss.str();
       mfem_error(error.c_str());
     }
-    integrators.push_back(integrator->CreateInstance(device,
-                                                     bIntegrator,
-                                                     fespace,
-                                                     baseKernelProps + props,
-                                                     itype));
+    integrator->SetupIntegrator(*this, baseKernelProps + props, itype);
+    integrators.push_back(integrator);
   }
 
   // Get the finite element space prolongation matrix
   const Operator* OccaBilinearForm::GetProlongation() const {
-    return prolongationOp;
+    return ofespace->GetProlongationOperator();
   }
 
   // Get the finite element space restriction matrix
   const Operator* OccaBilinearForm::GetRestriction() const {
-    return restrictionOp;
-  }
-
-  // Map the global dofs to local nodes
-  void OccaBilinearForm::VectorExtract(const OccaVector &globalVec,
-                                       OccaVector &localVec) const {
-
-    vectorExtractKernel((int) GetNDofs(),
-                        globalToLocalOffsets.memory(),
-                        globalToLocalIndices.memory(),
-                        globalVec, localVec);
-  }
-
-  // Aggregate local node values to their respective global dofs
-  void OccaBilinearForm::VectorAssemble(const OccaVector &localVec,
-                                        OccaVector &globalVec) const {
-
-    vectorAssembleKernel((int) GetNDofs(),
-                         globalToLocalOffsets.memory(),
-                         globalToLocalIndices.memory(),
-                         localVec, globalVec);
+    return ofespace->GetRestrictionOperator();
   }
 
   //
@@ -329,16 +161,29 @@ namespace mfem {
     }
   }
 
+  void OccaBilinearForm::FormOperator(const Array<int> &ess_tdof_list,
+                                      OccaVector &x, OccaVector &b,
+                                      Operator* &Aout,
+                                      OccaVector &X, OccaVector &B,
+                                      int copy_interior) {
+    FormLinearSystem(ess_tdof_list, x, b, Aout, X, B, copy_interior);
+  }
+
+  void OccaBilinearForm::FormOperator(const Array<int> &ess_tdof_list,
+                                      Operator *&Aout) {
+    // [MISSING]
+  }
+
   // Matrix vector multiplication.
   void OccaBilinearForm::Mult(const OccaVector &x, OccaVector &y) const {
-    VectorExtract(x, localX);
+    ofespace->GlobalToLocal(x, localX);
 
     const int integratorCount = (int) integrators.size();
     for (int i = 0; i < integratorCount; ++i) {
       integrators[i]->Mult(localX);
     }
 
-    VectorAssemble(localX, y);
+    ofespace->LocalToGlobal(localX, y);
   }
 
   // Matrix transpose vector multiplication.
@@ -439,13 +284,13 @@ namespace mfem {
 
     w = 0.0;
 
-    mapDofs(constraintIndices, w, x, constraintList.memory());
+    mapDofs(constraintIndices, w, x, constraintList);
 
     A->Mult(w, z);
 
     b -= z;
 
-    mapDofs(constraintIndices, b, x, constraintList.memory());
+    mapDofs(constraintIndices, b, x, constraintList);
   }
 
   void OccaConstrainedOperator::Mult(const OccaVector &x, OccaVector &y) const {
@@ -459,11 +304,11 @@ namespace mfem {
 
     z = x;
 
-    clearDofs(constraintIndices, z, constraintList.memory());
+    clearDofs(constraintIndices, z, constraintList);
 
     A->Mult(z, y);
 
-    mapDofs(constraintIndices, y, x, constraintList.memory());
+    mapDofs(constraintIndices, y, x, constraintList);
   }
 
   OccaConstrainedOperator::~OccaConstrainedOperator() {

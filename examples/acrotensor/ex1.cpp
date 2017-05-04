@@ -63,6 +63,7 @@ int main(int argc, char *argv[])
   const char *pc = "none";
   const char *device_info = "mode: 'CUDA', deviceID: 0";
   //const char *device_info = "mode: 'Serial'";
+
   bool occa_verbose = false;
   bool visualization = 1;
 

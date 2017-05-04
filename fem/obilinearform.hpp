@@ -21,6 +21,7 @@
 
 #include "../linalg/operator.hpp"
 #include "bilinearform.hpp"
+#include "ofespace.hpp"
 
 #include "occa.hpp"
 
@@ -38,57 +39,39 @@ namespace mfem {
   /** Class for bilinear form - "Matrix" with associated FE space and
       BLFIntegrators. */
   class OccaBilinearForm : public Operator {
+    friend class OccaIntegrator;
+
   protected:
     typedef std::vector<OccaIntegrator*> IntegratorVector;
-    typedef std::map<std::string,OccaIntegrator*> IntegratorBuilderMap;
 
     // State information
-    FiniteElementSpace *fespace;
+    mutable OccaFiniteElementSpace *ofespace;
+    mutable FiniteElementSpace *fespace;
     mutable Mesh *mesh;
 
-    // Group of integrators used to build kernels
-    static IntegratorBuilderMap integratorBuilders;
     IntegratorVector integrators;
 
     // Device data
     occa::device device;
     occa::properties baseKernelProps;
 
-    // Sparse storage for the global dof -> local node mapping
-    occa::array<int> globalToLocalOffsets, globalToLocalIndices;
-
     // The input vector is mapped to local nodes for easy and efficient operations
     // The size is: (number of elements) * (nodes in element)
     mutable OccaVector localX;
 
-    // Kernels to do the global -> local and local -> global mappings
-    occa::kernel vectorExtractKernel, vectorAssembleKernel;
-
-    Operator *restrictionOp, *prolongationOp;
-
   public:
-    OccaBilinearForm(FiniteElementSpace *fespace_);
-    OccaBilinearForm(occa::device device_, FiniteElementSpace *fespace_);
+    OccaBilinearForm(OccaFiniteElementSpace *ofespace_);
+    OccaBilinearForm(occa::device device_, OccaFiniteElementSpace *ofespace_);
 
-    void Init(occa::device device_, FiniteElementSpace *fespace_);
-
-    // Setup the kernel builder collection
-    void SetupIntegratorBuilderMap();
-
-    // Setup kernels and  properties
-    void SetupKernels();
-
-    // Setup device data needed for applying integrators
-    void SetupIntegratorData();
-
-    // Setup prolongation and restriction operators if needed
-    void SetupInterpolationData();
+    void Init(occa::device device_, OccaFiniteElementSpace *ofespace_);
 
     occa::device GetDevice();
 
     // Useful mesh Information
     int BaseGeom() const;
     Mesh& GetMesh() const;
+    FiniteElementSpace& GetFESpace() const;
+    OccaFiniteElementSpace& GetOccaFESpace() const;
 
     // Useful FE information
     int GetDim() const;
@@ -96,22 +79,6 @@ namespace mfem {
     int64_t GetNDofs() const;
     int64_t GetVDim() const;
     const FiniteElement& GetFE(const int i) const;
-
-    // Adds new Domain Integrator.
-    void AddDomainIntegrator(BilinearFormIntegrator *integrator,
-                             const occa::properties &props = occa::properties());
-
-    // Adds new Boundary Integrator.
-    void AddBoundaryIntegrator(BilinearFormIntegrator *integrator,
-                               const occa::properties &props = occa::properties());
-
-    // Adds new interior Face Integrator.
-    void AddInteriorFaceIntegrator(BilinearFormIntegrator *integrator,
-                                   const occa::properties &props = occa::properties());
-
-    // Adds new boundary Face Integrator.
-    void AddBoundaryFaceIntegrator(BilinearFormIntegrator *integrator,
-                                   const occa::properties &props = occa::properties());
 
     // Adds new Domain Integrator.
     void AddDomainIntegrator(OccaIntegrator *integrator,
@@ -130,18 +97,7 @@ namespace mfem {
                                    const occa::properties &props = occa::properties());
 
     // Adds Integrator based on OccaIntegratorType
-    void AddIntegrator(BilinearFormIntegrator *integrator,
-                       const occa::properties &props,
-                       const OccaIntegratorType itype);
-
-    // Adds Integrator based on OccaIntegratorType
     void AddIntegrator(OccaIntegrator *integrator,
-                       const occa::properties &props,
-                       const OccaIntegratorType itype);
-
-    // Adds Integrator based on OccaIntegratorType
-    void AddIntegrator(BilinearFormIntegrator *bIntegrator,
-                       OccaIntegrator *integrator,
                        const occa::properties &props,
                        const OccaIntegratorType itype);
 
@@ -150,14 +106,17 @@ namespace mfem {
     // Get the finite element space restriction matrix
     virtual const Operator *GetRestriction() const;
 
-    // Map the global dofs to local nodes
-    void VectorExtract(const OccaVector &globalVec, OccaVector &localVec) const;
-
-    // Aggregate local node values to their respective global dofs
-    void VectorAssemble(const OccaVector &localVec, OccaVector &globalVec) const;
-
     // Assembles the form i.e. sums over all domain/bdr integrators.
     virtual void Assemble();
+
+    void FormOperator(const Array<int> &ess_tdof_list,
+                      OccaVector &x, OccaVector &b,
+                      Operator* &Aout,
+                      OccaVector &X, OccaVector &B,
+                      int copy_interior = 0);
+
+    void FormOperator(const Array<int> &ess_tdof_list,
+                      Operator *&Aout);
 
     // Matrix vector multiplication.
     virtual void Mult(const OccaVector &x, OccaVector &y) const;
