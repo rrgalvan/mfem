@@ -25,6 +25,7 @@ list(APPEND ALL_EXE_SRCS
   ex16.cpp
   ex17.cpp
   exStokes.cpp
+  exWeakGalerkin.cpp
   )
 
 if (MFEM_USE_MPI)
