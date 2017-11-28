@@ -51,14 +51,9 @@ endif
 # Note: symbols of the form @VAR@ will be replaced by $(VAR) in derived
 #       variables, like MFEM_FLAGS, defined in config.mk.
 
-# Command used to launch MPI jobs
-MFEM_MPIEXEC    = mpirun
-MFEM_MPIEXEC_NP = -np
-
 # MFEM configuration options: YES/NO values, which are exported to config.mk and
 # config.hpp. The values below are the defaults for generating the actual values
 # in config.mk and config.hpp.
-
 MFEM_USE_MPI         = NO
 MFEM_USE_METIS_5     = NO
 MFEM_DEBUG           = NO
@@ -84,18 +79,18 @@ LIBUNWIND_OPT = -g
 LIBUNWIND_LIB = $(if $(NOTMAC),-lunwind -ldl,)
 
 # HYPRE library configuration (needed to build the parallel version)
-HYPRE_DIR = @MFEM_DIR@/../hypre-2.10.0b/src/hypre
+# HYPRE_DIR = @MFEM_DIR@/../hypre-2.10.0b/src/hypre # Versión original (Rafa)
+HYPRE_DIR = @MFEM_DIR@/../hypre-2.11.2/src/hypre
 HYPRE_OPT = -I$(HYPRE_DIR)/include
 HYPRE_LIB = -L$(HYPRE_DIR)/lib -lHYPRE
 
 # METIS library configuration
 ifeq ($(MFEM_USE_SUPERLU),NO)
    ifeq ($(MFEM_USE_METIS_5),NO)
-     METIS_DIR = @MFEM_DIR@/../metis-4.0
      METIS_OPT =
      METIS_LIB = -L$(METIS_DIR) -lmetis
    else
-     METIS_DIR = @MFEM_DIR@/../metis-5.0
+     METIS_DIR = @MFEM_DIR@/../metis-5
      METIS_OPT = -I$(METIS_DIR)/include
      METIS_LIB = -L$(METIS_DIR)/lib -lmetis
    endif
@@ -172,8 +167,8 @@ ifeq ($(MFEM_USE_PETSC),YES)
    PETSC_PC  := $(PETSC_DIR)/lib/pkgconfig/PETSc.pc
    $(if $(wildcard $(PETSC_PC)),,$(error PETSc config not found - $(PETSC_PC)))
    PETSC_OPT := $(shell sed -n "s/Cflags: *//p" $(PETSC_PC))
-   PETSC_LIBS_PRIVATE := $(shell sed -n "s/Libs\.private: *//p" $(PETSC_PC))
-   PETSC_LIB := -Wl,-rpath -Wl,$(abspath $(PETSC_DIR))/lib -L$(abspath $(PETSC_DIR))/lib -lpetsc $(PETSC_LIBS_PRIVATE)
+   PETSC_LIB := $(shell sed -n "s/Libs.*: *//p" $(PETSC_PC))
+   PETSC_LIB := -Wl,-rpath -Wl,$(abspath $(PETSC_DIR))/lib $(PETSC_LIB)
 endif
 
 # MPFR library configuration
