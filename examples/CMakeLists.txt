@@ -25,6 +25,7 @@ list(APPEND ALL_EXE_SRCS
   ex16.cpp
   ex17.cpp
   exStokes.cpp
+  exKellerSegel.cpp
   exWeakGalerkin.cpp
   )
 
