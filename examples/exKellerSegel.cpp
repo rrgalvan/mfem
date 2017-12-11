@@ -16,14 +16,14 @@
 //               exKellerSegel -m ../data/amr-hex.mesh -o 2 -r 0
 //
 // Description:  This example solves a (uncoupled) time dependent Keller-Segel
-//               equation problem of the form
+//         equation problem of the form
 //
-//               du^{m+1}/dt - k0 \Delta u^{m+1} = - k1 \nabla \cdot (u^m \nabla v^m),
-//               dv^{m+1}/dt - k2 \Delta v^{m+1} = - k2 v^m + k3 u^m,
+//         du^{m+1}/dt - k0 \Delta u^{m+1} + k1 \nabla \cdot (u^{m+1} \nabla v^m) = 0
+//         dv^{m+1}/dt - k2 \Delta v^{m+1} = - k2 v^m + k3 u^m,
 //
-//               with homogeneous Neumann boundary conditions. The unknown u represents
-//               biological cell distribution while v stands for a chemical substance
-//               whose gradient influences cell growth
+//         with homogeneous Neumann boundary conditions. The unknown u represents
+//         biological cell distribution while v stands for a chemical substance
+//         whose gradient influences cell growth
 
 #include "mfem.hpp"
 #include <fstream>
@@ -34,39 +34,39 @@ using namespace mfem;
 
 /** After spatial discretization, equations can be written as:
  *
- *     du/dt = M^{-1}( -KU u + R(u^m,v^m) )
- *     dv/dt = M^{-1}( -KV u + S(u^m,v^m) )
+ *     du/dt = M^{-1}( -K_u u + R(v^m)u )
+ *     dv/dt = M^{-1}( -K_v v + S(u^m,v^m) )
  *
  *  where u=u^{m+1} is the vector representing the density of live cells at
- *  t=t^{m+1}, M is the mass matrix, KU is the diffusion operator with
- *  diffusivity constant k0 and R(u^m,v^m) is the explicit cross diffusion
- *  operator R(u^m,v^m)(w) = k1 u^m \nabla v^m \nabla w.
+ *  t=t^{m+1}, M is the mass matrix, K_u is the diffusion operator with
+ *  diffusivity constant k0 and R(v^m)u is the explicit cross diffusion
+ *  operator R(v^m) u w = k1 u \nabla v^m \nabla w.
  *
  *  On the other hand, v=v^{m+1} is the vector representing chemical
- *  substance at t=t^{m+1}, KV is the diffusion operator with diffusivity
+ *  substance at t=t^{m+1}, K_v is the diffusion operator with diffusivity
  *  constant k2 and S(u^m, v^m) = -k3 v^m + k4 u^m.
- *
  *
  *  Class KellerSegelOperator represents the right-hand side of the above ODE.
  */
 class KellerSegelOperator : public TimeDependentOperator
 {
 protected:
-  FiniteElementSpace &fespace;
+  FiniteElementSpace &fespace, &grad_fespace;
   Array<int> ess_tdof_list; // this list remains empty for pure Neumann b.c.
 
   BilinearForm *M;
-  BilinearForm *KU;
-  BilinearForm *KV;
+  BilinearForm *K_u;
+  BilinearForm *K_v;
+  BilinearForm *R;
 
-  SparseMatrix Mmat, KUmat, KVmat;
-  SparseMatrix *T; // T = M + dt KU
+  SparseMatrix Mmat, KUmat, KVmat, Rmat;
+  SparseMatrix *T; // T = M + dt K_u
   double current_dt;
 
   CGSolver M_solver; // Krylov solver for inverting the mass matrix M
   DSmoother M_prec;  // Preconditioner for the mass matrix M
 
-  CGSolver T_solver; // Implicit solver for T = M + dt KU
+  CGSolver T_solver; // Implicit solver for T = M + dt K_u
   DSmoother T_prec;  // Preconditioner for the implicit solver
 
   double k0, k1, k2, k3, k4;
@@ -82,7 +82,7 @@ public:
       This is the only requirement for high-order SDIRK implicit integration.*/
   virtual void ImplicitSolve(const double dt, const Vector &u, Vector &k);
 
-  /// Update the diffusion BilinearForm KU using the given true-dof vector `u`.
+  /// Update the diffusion BilinearForm K_u using the given true-dof vector `u`.
   void SetParameters(const Vector &u);
 
   virtual ~KellerSegelOperator();
@@ -192,44 +192,46 @@ int main(int argc, char *argv[])
       mesh->UniformRefinement();
     }
 
-  // 5. Define the vector finite element space representing the current and the
-  //    initial temperature, u_ref.
+  // 5. Define the vector finite element space representing the live
+  // cell density, u, and the chemical substance, v.
+  // Define also a L2 finite element space for the gradiento of v
   H1_FECollection fe_coll(order, dim);
   FiniteElementSpace fespace(mesh, &fe_coll);
 
   int fe_size = fespace.GetTrueVSize();
-  cout << "Number of temperature unknowns: " << fe_size << endl;
+  cout << "Number of u/v unknowns: " << fe_size << endl;
 
-  GridFunction u_gf(&fespace);
+  Array<int> fe_offset(3);
+  fe_offset[0] = 0;
+  fe_offset[1] = fe_size;
+  fe_offset[2] = 2*fe_size;
+
+  BlockVector uv(fe_offset);
+  GridFunction u, v;
+  u.MakeRef(&fespace, uv.GetBlock(0), 0);
+  v.MakeRef(&fespace, uv.GetBlock(1), 0);
+
+  L2_FECollection grad_fec(order, dim);
+  FiniteElementSpace grad_fespace(mesh, &grad_fec);
 
   // 6. Set the initial conditions for u. All boundaries are considered
   //    natural.
   FunctionCoefficient u_0(InitialU);
-  u_gf.ProjectCoefficient(u_0);
-  Vector u;
-  u_gf.GetTrueDofs(u);
+  u.ProjectCoefficient(u_0);
+
+  FunctionCoefficient v_0(InitialV);
+  v.ProjectCoefficient(v_0);
 
   // 7. Initialize the conduction operator and the visualization.
-  KellerSegelOperator oper(fespace, k0, k1, k2, k3, k4, u);
 
-  u_gf.SetFromTrueDofs(u);
-  {
-    ofstream omesh("exKellerSegel.mesh");
-    omesh.precision(precision);
-    mesh->Print(omesh);
-    ofstream osol("exKellerSegel-init.gf");
-    osol.precision(precision);
-    u_gf.Save(osol);
-  }
-
-  VisItDataCollection visit_dc("ExampleKS", mesh);
-  visit_dc.RegisterField("Keller-Segel", &u_gf);
-  if (visit)
-    {
+   VisItDataCollection visit_dc("Example Keller-Segel", mesh);
+   visit_dc.RegisterField("u", &u);
+   if (visit)
+   {
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
-    }
+   }
 
   socketstream sout;
   if (visualization)
@@ -247,7 +249,7 @@ int main(int argc, char *argv[])
       else
 	{
 	  sout.precision(precision);
-	  sout << "solution\n" << *mesh << u_gf;
+	  sout << "solution (u)\n" << *mesh << u;
 	  sout << "pause\n";
 	  sout << flush;
 	  cout << "GLVis visualization paused."
@@ -257,8 +259,9 @@ int main(int argc, char *argv[])
 
   // 8. Perform time-integration (looping over the time iterations, ti, with a
   //    time-step dt).
-  ode_solver->Init(oper);
+  oper.SetTime(t);
   double t = 0.0;
+  ode_solver->Init(oper);
 
   bool last_step = false;
   for (int ti = 1; !last_step; ti++)
@@ -277,7 +280,7 @@ int main(int argc, char *argv[])
 	  u_gf.SetFromTrueDofs(u);
 	  if (visualization)
 	    {
-	      sout << "solution\n" << *mesh << u_gf << flush;
+	      sout << "solution (u)\n" << *mesh << u << flush;
 	    }
 
 	  if (visit)
@@ -287,7 +290,7 @@ int main(int argc, char *argv[])
 	      visit_dc.Save();
 	    }
 	}
-      oper.SetParameters(u);
+      oper.SetParameters(u,v);
     }
 
   // 9. Save the final solution. This output can be viewed later using GLVis:
@@ -295,7 +298,7 @@ int main(int argc, char *argv[])
   {
     ofstream osol("exKellerSegel-final.gf");
     osol.precision(precision);
-    u_gf.Save(osol);
+    u.Save(osol);
   }
 
   // 10. Free the used memory.
@@ -306,10 +309,15 @@ int main(int argc, char *argv[])
 }
 
 KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
+					 FiniteElementSpace &g_f,
 					 double k0_, double k1_, double k2_,
-					 double k3_, double k4_, const Vector &u)
-  : TimeDependentOperator(f.GetTrueVSize(), 0.0), fespace(f),
-    M(NULL), KU(NULL), KV(NULL), T(NULL), current_dt(0.0), z(height)
+					 double k3_, double k4_,
+					 const GridFunction& u,
+					 const GridFunction& v)
+  : TimeDependentOperator(f.GetTrueVSize(), 0.0),
+    fespace(f), grad_fespace(g_f),
+    M(NULL), K_u(NULL), K_v(NULL), R(NULL), T(NULL),
+    current_dt(0.0), z(height)
 {
   const double rel_tol = 1e-8;
 
@@ -328,17 +336,17 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   M_solver.SetPreconditioner(M_prec);
   M_solver.SetOperator(Mmat);
 
-  KU = new BilinearForm(&fespace);
+  K_u = new BilinearForm(&fespace);
   ConstantCoefficient k0_coeff(k0);
-  KU->AddDomainIntegrator(new DiffusionIntegrator(k0_coeff));
-  KU->Assemble();
-  KU->FormSystemMatrix(ess_tdof_list, KUmat);
+  K_u->AddDomainIntegrator(new DiffusionIntegrator(k0_coeff));
+  K_u->Assemble();
+  K_u->FormSystemMatrix(ess_tdof_list, KUmat);
 
-  KV = new BilinearForm(&fespace);
+  K_v = new BilinearForm(&fespace);
   ConstantCoefficient k2_coeff(k2);
-  KV->AddDomainIntegrator(new DiffusionIntegrator(u_coeff));
-  KV->Assemble();
-  KV->FormSystemMatrix(ess_tdof_list, KVmat);
+  K_v->AddDomainIntegrator(new DiffusionIntegrator(k2_coeff));
+  K_v->Assemble();
+  K_v->FormSystemMatrix(ess_tdof_list, KVmat);
 
   T_solver.iterative_mode = false;
   T_solver.SetRelTol(rel_tol);
@@ -347,7 +355,7 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   T_solver.SetPrintLevel(0);
   T_solver.SetPreconditioner(T_prec);
 
-  SetParameters(u);
+  SetParameters(u, v);
 }
 
 void KellerSegelOperator::Mult(const Vector &uv, Vector &duv_dt) const
@@ -359,7 +367,7 @@ void KellerSegelOperator::Mult(const Vector &uv, Vector &duv_dt) const
    Vector du_dt(duv_dt.GetData() +  0, sc);
    Vector dv_dt(duv_dt.GetData() + sc, sc);
   // Compute:
-  //    du_dt = M^{-1}*(-KU(u) + R)
+  //    du_dt = M^{-1}*(-K_u(u) + R(v^m)(u) )
   // for du_dt
   KUmat.Mult(u, z);
   z.Neg(); // z = -z
@@ -380,7 +388,7 @@ void KellerSegelOperator::ImplicitSolve(const double dt,
 					const Vector &u, Vector &du_dt)
 {
   // Solve the equation:
-  //    du_dt = M^{-1}*[-KU(u + dt*du_dt)]
+  //    du_dt = M^{-1}*[-K_u(u + dt*du_dt)]
   // for du_dt
   if (!T)
     {
@@ -394,8 +402,23 @@ void KellerSegelOperator::ImplicitSolve(const double dt,
   T_solver.Mult(z, du_dt);
 }
 
-void KellerSegelOperator::SetParameters(const Vector &u)
+void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunction &v)
 {
+  DiscreteLinearOperator G(&fespace, &grad_fespace);
+  G.AddDomainInterpolator(new GradientInterpolator);
+  G->Assemble()
+  G->FormSystemMatrix(ess_tdof_list, Gmat);
+  Vector grad_v( grad_fespace.GetTrueVSize() );
+  Gmat.Mult(v, grad_v); // Compute gradient
+
+  delete R;
+  R = new BilinearForm(&fespace);
+  ConstantCoefficient k1_coeff(k1);
+  K_v->AddDomainIntegrator(new DiffusionIntegrator(k1_coeff));
+  K_v->Assemble();
+  K_v->FormSystemMatrix(ess_tdof_list, KVmat);
+
+
   delete T;
   T = NULL; // re-compute T on the next ImplicitSolve
 }
@@ -404,8 +427,8 @@ KellerSegelOperator::~KellerSegelOperator()
 {
   delete T;
   delete M;
-  delete KU;
-  delete KV;
+  delete K_u;
+  delete K_v;
 }
 
 double InitialU(const Vector &x)
