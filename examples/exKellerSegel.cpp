@@ -58,8 +58,9 @@ protected:
   BilinearForm *K_u;
   BilinearForm *K_v;
   BilinearForm *R;
+  BilinearForm *G;
 
-  SparseMatrix Mmat, KUmat, KVmat, Rmat;
+  SparseMatrix Mmat, KUmat, KVmat, Rmat, KuRmat, Gmat;
   SparseMatrix *T; // T = M + dt K_u
   double current_dt;
 
@@ -71,11 +72,11 @@ protected:
 
   double k0, k1, k2, k3, k4;
 
-  mutable Vector z; // auxiliary vector
+  mutable Vector y, z; // auxiliary vectors
 
 public:
-  KellerSegelOperator(FiniteElementSpace &f, double k0_, double k1_,
-		      double k2_, double k3_, double k4_, const Vector &u);
+  KellerSegelOperator(FiniteElementSpace &f, FiniteElementSpace &g_f, double k0_, double k1_,
+		      double k2_, double k3_, double k4_, const GridFunction &u, const GridFunction &v);
 
   virtual void Mult(const Vector &uv, Vector &duv_dt) const;
   /** Solve the Backward-Euler equation: k = f(u + dt*k, t), for the unknown k.
@@ -89,6 +90,7 @@ public:
 };
 
 double InitialU(const Vector &x);
+double InitialV(const Vector &x);
 
 int main(int argc, char *argv[])
 {
@@ -222,16 +224,18 @@ int main(int argc, char *argv[])
   FunctionCoefficient v_0(InitialV);
   v.ProjectCoefficient(v_0);
 
-  // 7. Initialize the conduction operator and the visualization.
+  // 7. Initialize the Keller-Segel operator and the visualization.
 
-   VisItDataCollection visit_dc("Example Keller-Segel", mesh);
-   visit_dc.RegisterField("u", &u);
-   if (visit)
-   {
+  KellerSegelOperator oper(fespace, grad_fespace, k0, k1, k2, k3, k4, u, v);
+
+  VisItDataCollection visit_dc("Example Keller-Segel", mesh);
+  visit_dc.RegisterField("u", &u);
+  if (visit)
+    {
       visit_dc.SetCycle(0);
       visit_dc.SetTime(0.0);
       visit_dc.Save();
-   }
+    }
 
   socketstream sout;
   if (visualization)
@@ -259,8 +263,8 @@ int main(int argc, char *argv[])
 
   // 8. Perform time-integration (looping over the time iterations, ti, with a
   //    time-step dt).
-  oper.SetTime(t);
   double t = 0.0;
+  oper.SetTime(t);
   ode_solver->Init(oper);
 
   bool last_step = false;
@@ -316,7 +320,7 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
 					 const GridFunction& v)
   : TimeDependentOperator(f.GetTrueVSize(), 0.0),
     fespace(f), grad_fespace(g_f),
-    M(NULL), K_u(NULL), K_v(NULL), R(NULL), T(NULL),
+    M(NULL), K_u(NULL), K_v(NULL), R(NULL), G(NULL), T(NULL),
     current_dt(0.0), z(height)
 {
   const double rel_tol = 1e-8;
@@ -348,6 +352,11 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   K_v->Assemble();
   K_v->FormSystemMatrix(ess_tdof_list, KVmat);
 
+  G = new DiscreteLinearOperator(&fespace, &grad_fespace);
+  G->AddDomainInterpolator(new GradientInterpolator);
+  G->Assemble()
+    G->FormSystemMatrix(ess_tdof_list, Gmat);
+
   T_solver.iterative_mode = false;
   T_solver.SetRelTol(rel_tol);
   T_solver.SetAbsTol(0.0);
@@ -360,64 +369,81 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
 
 void KellerSegelOperator::Mult(const Vector &uv, Vector &duv_dt) const
 {
-   // Create views to the sub-vectors u, v of uv, and du_dt, dv_dt of duv_dt
-   int sc = height/2;
-   Vector u(uv.GetData() +  0, sc);
-   Vector v(uv.GetData() + sc, sc);
-   Vector du_dt(duv_dt.GetData() +  0, sc);
-   Vector dv_dt(duv_dt.GetData() + sc, sc);
-  // Compute:
-  //    du_dt = M^{-1}*(-K_u(u) + R(v^m)(u) )
-  // for du_dt
-  KUmat.Mult(u, z);
-  z.Neg(); // z = -z
+  // Create views to the sub-vectors u, v of uv, and du_dt, dv_dt of duv_dt
+  int sc = height/2;
+  Vector u(uv.GetData() +  0, sc);
+  Vector v(uv.GetData() + sc, sc);
+  Vector du_dt(duv_dt.GetData() +  0, sc);
+  Vector dv_dt(duv_dt.GetData() + sc, sc);
+
+  // Compute: du/dt = M^{-1}( (-K_u + k1 R(v^m) ) u )
+  KuRmat.Mult(u, z);
   M_solver.Mult(z, du_dt);
 
-   H.Mult(x, z);
-   if (viscosity != 0.0)
-   {
-      S.AddMult(v, z);
-   }
-   z.Neg(); // z = -z
-   M_solver.Mult(z, dv_dt);
+  // Compute: dv/dt = M^{-1}( -K_v v + S(u^m,v^m) )
+  KVmat.Mult(v, z);
+  z.Neg(); // z = -z
+  M_solver.Mult(z, dv_dt);
 
-   dx_dt = v;
+  // TODO: TENER EN CUENTA S(u^m,v^m) !!!
 }
 
 void KellerSegelOperator::ImplicitSolve(const double dt,
-					const Vector &u, Vector &du_dt)
+					const Vector &uv, Vector &duv_dt)
 {
+  // Create views to the sub-vectors u, v of uv, and du_dt, dv_dt of duv_dt
+  int sc = height/2;
+  Vector u(uv.GetData() +  0, sc);
+  Vector v(uv.GetData() + sc, sc);
+  Vector du_dt(duv_dt.GetData() +  0, sc);
+  Vector dv_dt(duv_dt.GetData() + sc, sc);
+
   // Solve the equation:
-  //    du_dt = M^{-1}*[-K_u(u + dt*du_dt)]
-  // for du_dt
+  //    du_dt = M^{-1}*[ KuRMat (u + dt*du_dt)]
+  // for du_dt, where KuRMat = (-K_u + k1 R(v^m))
   if (!T)
     {
-      T = Add(1.0, Mmat, dt, KUmat);
+      T = Add(1.0, Mmat, dt, KuRmat);
       current_dt = dt;
       T_solver.SetOperator(*T);
     }
   MFEM_VERIFY(dt == current_dt, ""); // SDIRK methods use the same dt
-  KUmat.Mult(u, z);
+  KuRmat.Mult(u, z);
   z.Neg();
   T_solver.Mult(z, du_dt);
+
+  // Solve the equation:
+  //    dv_dt = M^{-1}*[ -K_v (v + dt*dv_dt) + S(u^m,v^m) )]
+  // for dv_dt
+  delete T;
+  T = Add(1.0, Mmat, dt, KVmat);
+  current_dt = dt;
+  T_solver.SetOperator(*T);
+  MFEM_VERIFY(dt == current_dt, ""); // SDIRK methods use the same dt
+
+  KVmat.Mult(v, z);
+  z.Neg();
+  T_solver.Mult(z, dv_dt);
+
+  // TODO: TENER EN CUENTA S(u^m,v^m) !!!
 }
 
 void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunction &v)
 {
-  DiscreteLinearOperator G(&fespace, &grad_fespace);
-  G.AddDomainInterpolator(new GradientInterpolator);
-  G->Assemble()
-  G->FormSystemMatrix(ess_tdof_list, Gmat);
+  // Compute gradient of v
   Vector grad_v( grad_fespace.GetTrueVSize() );
-  Gmat.Mult(v, grad_v); // Compute gradient
+  Gmat.Mult(v, grad_v);
 
+  // Define R(v) u = div(u grad_v) i.e. (R(v) u, w) = (-grad_v u, grad(w))
   delete R;
   R = new BilinearForm(&fespace);
-  ConstantCoefficient k1_coeff(k1);
-  K_v->AddDomainIntegrator(new DiffusionIntegrator(k1_coeff));
-  K_v->Assemble();
-  K_v->FormSystemMatrix(ess_tdof_list, KVmat);
+  VectorConstantCoefficient gv_coeff(grad_v);
+  R->AddDomainIntegrator(new MixedScalarWeakDivergenceIntegrator(gv_coeff));
+  R->Assemble();
+  R->FormSystemMatrix(ess_tdof_list, Rmat);
 
+  // Define KuR(v) = - K_u + k1 R(v)
+  KuRmat = Add(-1.0, KUmat, k1, Rmat);
 
   delete T;
   T = NULL; // re-compute T on the next ImplicitSolve
@@ -429,16 +455,24 @@ KellerSegelOperator::~KellerSegelOperator()
   delete M;
   delete K_u;
   delete K_v;
+  delete R;
+  delete G;
 }
 
 double InitialU(const Vector &x)
 {
   if (x.Norml2() < 0.5)
     {
-      return 2.0;
+      return 0.5-x.Norml2();
     }
   else
     {
-      return 1.0;
+      return 0.0;
     }
+}
+
+
+double InitialV(const Vector &x)
+{
+  return InitialU(x);
 }
