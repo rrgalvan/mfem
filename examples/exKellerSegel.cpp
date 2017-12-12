@@ -58,9 +58,10 @@ protected:
   BilinearForm *K_u;
   BilinearForm *K_v;
   BilinearForm *R;
-  BilinearForm *G;
+  DiscreteLinearOperator *G; // For computing gradient
 
-  SparseMatrix Mmat, KUmat, KVmat, Rmat, KuRmat, Gmat;
+  SparseMatrix Mmat, KUmat, KVmat, Rmat, Gmat;
+  SparseMatrix KuRmat; // KuRmat = - K_u + k2 R(v^m)
   SparseMatrix *T; // T = M + dt K_u
   double current_dt;
 
@@ -72,19 +73,20 @@ protected:
 
   double k0, k1, k2, k3, k4;
 
-  mutable Vector y, z; // auxiliary vectors
+  mutable Vector z; // auxiliary vector
 
 public:
-  KellerSegelOperator(FiniteElementSpace &f, FiniteElementSpace &g_f, double k0_, double k1_,
-		      double k2_, double k3_, double k4_, const GridFunction &u, const GridFunction &v);
+  KellerSegelOperator(FiniteElementSpace &f, FiniteElementSpace &g_f,
+		      double k0_, double k1_, double k2_, double k3_, double k4_,
+		      const GridFunction &u, const GridFunction &v);
 
   virtual void Mult(const Vector &uv, Vector &duv_dt) const;
   /** Solve the Backward-Euler equation: k = f(u + dt*k, t), for the unknown k.
       This is the only requirement for high-order SDIRK implicit integration.*/
-  virtual void ImplicitSolve(const double dt, const Vector &u, Vector &k);
+  virtual void ImplicitSolve(const double dt, const Vector &uv, Vector &duv_dt);
 
   /// Update the diffusion BilinearForm K_u using the given true-dof vector `u`.
-  void SetParameters(const Vector &u);
+  void SetParameters(const GridFunction &u, const GridFunction &v);
 
   virtual ~KellerSegelOperator();
 };
@@ -194,9 +196,8 @@ int main(int argc, char *argv[])
       mesh->UniformRefinement();
     }
 
-  // 5. Define the vector finite element space representing the live
+  // 5. Define the finite element space representing the live
   // cell density, u, and the chemical substance, v.
-  // Define also a L2 finite element space for the gradiento of v
   H1_FECollection fe_coll(order, dim);
   FiniteElementSpace fespace(mesh, &fe_coll);
 
@@ -213,8 +214,10 @@ int main(int argc, char *argv[])
   u.MakeRef(&fespace, uv.GetBlock(0), 0);
   v.MakeRef(&fespace, uv.GetBlock(1), 0);
 
+  // Define also the vector finite element space representing the
+  // gradient of v
   L2_FECollection grad_fec(order, dim);
-  FiniteElementSpace grad_fespace(mesh, &grad_fec);
+  FiniteElementSpace grad_fespace(mesh, &grad_fec, dim);
 
   // 6. Set the initial conditions for u. All boundaries are considered
   //    natural.
@@ -275,13 +278,12 @@ int main(int argc, char *argv[])
 	  last_step = true;
 	}
 
-      ode_solver->Step(u, t, dt);
+      ode_solver->Step(uv, t, dt);
 
       if (last_step || (ti % vis_steps) == 0)
 	{
 	  cout << "step " << ti << ", t = " << t << endl;
 
-	  u_gf.SetFromTrueDofs(u);
 	  if (visualization)
 	    {
 	      sout << "solution (u)\n" << *mesh << u << flush;
@@ -354,8 +356,8 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
 
   G = new DiscreteLinearOperator(&fespace, &grad_fespace);
   G->AddDomainInterpolator(new GradientInterpolator);
-  G->Assemble()
-    G->FormSystemMatrix(ess_tdof_list, Gmat);
+  G->Assemble();
+  // G->FormSystemMatrix(ess_tdof_list, Gmat);
 
   T_solver.iterative_mode = false;
   T_solver.SetRelTol(rel_tol);
@@ -432,7 +434,8 @@ void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunctio
 {
   // Compute gradient of v
   Vector grad_v( grad_fespace.GetTrueVSize() );
-  Gmat.Mult(v, grad_v);
+  // Gmat.Mult(v, grad_v);
+  G->Mult(v, grad_v);
 
   // Define R(v) u = div(u grad_v) i.e. (R(v) u, w) = (-grad_v u, grad(w))
   delete R;
@@ -443,7 +446,9 @@ void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunctio
   R->FormSystemMatrix(ess_tdof_list, Rmat);
 
   // Define KuR(v) = - K_u + k1 R(v)
-  KuRmat = Add(-1.0, KUmat, k1, Rmat);
+  KuRmat.Clear();
+  KuRmat.Add(-1.0, KUmat);
+  KuRmat.Add(  k1, Rmat);
 
   delete T;
   T = NULL; // re-compute T on the next ImplicitSolve
