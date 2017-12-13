@@ -29,6 +29,8 @@
 #include <fstream>
 #include <iostream>
 
+#define PRINT_INFO(x) {if(x) cout << "#" << (x) << endl;}
+
 using namespace std;
 using namespace mfem;
 
@@ -57,7 +59,7 @@ protected:
   BilinearForm *M;
   BilinearForm *K_u;
   BilinearForm *K_v;
-  BilinearForm *R;
+  MixedBilinearForm *R; // To use MixedScalarWeakDivergenceIntegrator
   DiscreteLinearOperator *G; // For computing gradient
 
   SparseMatrix Mmat, KUmat, KVmat, Rmat, Gmat;
@@ -100,7 +102,7 @@ int main(int argc, char *argv[])
   const char *mesh_file = "../data/periodic-square.mesh";
   int ref_levels = 2;
   int order = 2;
-  int ode_solver_type = 3;
+  int ode_solver_type = 11; //3;
   double t_final = 0.5;
   double dt = 1.0e-2;
   double k0 = 1.0;
@@ -231,19 +233,19 @@ int main(int argc, char *argv[])
 
   KellerSegelOperator oper(fespace, grad_fespace, k0, k1, k2, k3, k4, u, v);
 
-  VisItDataCollection visit_dc("Example Keller-Segel", mesh);
-  visit_dc.RegisterField("u", &u);
-  if (visit)
-    {
-      visit_dc.SetCycle(0);
-      visit_dc.SetTime(0.0);
-      visit_dc.Save();
-    }
+  // VisItDataCollection visit_dc("Example Keller-Segel", mesh);
+  // visit_dc.RegisterField("u", &u);
+  // if (visit)
+  //   {
+  //     visit_dc.SetCycle(0);
+  //     visit_dc.SetTime(0.0);
+  //     visit_dc.Save();
+  //   }
 
   socketstream sout;
   if (visualization)
     {
-      // char vishost[] = "localhost";
+      char vishost[] = "localhost";
       int  visport   = 19916;
       sout.open(vishost, visport);
       if (!sout)
@@ -264,11 +266,15 @@ int main(int argc, char *argv[])
 	}
     }
 
+  PRINT_INFO(1000);
+
   // 8. Perform time-integration (looping over the time iterations, ti, with a
   //    time-step dt).
   double t = 0.0;
   oper.SetTime(t);
   ode_solver->Init(oper);
+
+  PRINT_INFO(1001);
 
   bool last_step = false;
   for (int ti = 1; !last_step; ti++)
@@ -280,6 +286,8 @@ int main(int argc, char *argv[])
 
       ode_solver->Step(uv, t, dt);
 
+      PRINT_INFO(1002);
+
       if (last_step || (ti % vis_steps) == 0)
 	{
 	  cout << "step " << ti << ", t = " << t << endl;
@@ -289,14 +297,16 @@ int main(int argc, char *argv[])
 	      sout << "solution (u)\n" << *mesh << u << flush;
 	    }
 
-	  if (visit)
-	    {
-	      visit_dc.SetCycle(ti);
-	      visit_dc.SetTime(t);
-	      visit_dc.Save();
-	    }
+	  // if (visit)
+	  //   {
+	  //     visit_dc.SetCycle(ti);
+	  //     visit_dc.SetTime(t);
+	  //     visit_dc.Save();
+	  //   }
 	}
+      PRINT_INFO(1003);
       oper.SetParameters(u,v);
+      PRINT_INFO(1004);
     }
 
   // 9. Save the final solution. This output can be viewed later using GLVis:
@@ -354,10 +364,16 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   K_v->Assemble();
   K_v->FormSystemMatrix(ess_tdof_list, KVmat);
 
+
+  PRINT_INFO(1)
+
   G = new DiscreteLinearOperator(&fespace, &grad_fespace);
   G->AddDomainInterpolator(new GradientInterpolator);
   G->Assemble();
+  G->Finalize();
   // G->FormSystemMatrix(ess_tdof_list, Gmat);
+
+  PRINT_INFO(2)
 
   T_solver.iterative_mode = false;
   T_solver.SetRelTol(rel_tol);
@@ -366,7 +382,11 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   T_solver.SetPrintLevel(0);
   T_solver.SetPreconditioner(T_prec);
 
+  PRINT_INFO(3)
+
   SetParameters(u, v);
+
+  PRINT_INFO(300)
 }
 
 void KellerSegelOperator::Mult(const Vector &uv, Vector &duv_dt) const
@@ -437,18 +457,31 @@ void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunctio
   // Gmat.Mult(v, grad_v);
   G->Mult(v, grad_v);
 
+  PRINT_INFO(10);
+
   // Define R(v) u = div(u grad_v) i.e. (R(v) u, w) = (-grad_v u, grad(w))
   delete R;
-  R = new BilinearForm(&fespace);
+  R = new MixedBilinearForm(&fespace,&fespace);
+  PRINT_INFO(11);
   VectorConstantCoefficient gv_coeff(grad_v);
+  PRINT_INFO(12);
   R->AddDomainIntegrator(new MixedScalarWeakDivergenceIntegrator(gv_coeff));
+  PRINT_INFO(13);
   R->Assemble();
-  R->FormSystemMatrix(ess_tdof_list, Rmat);
+  PRINT_INFO(14);
+  R->Finalize();
+  PRINT_INFO(15);
+  // R->FormSystemMatrix(ess_tdof_list, Rmat);
+  Rmat = R->SpMat();
+
+  PRINT_INFO(20);
 
   // Define KuR(v) = - K_u + k1 R(v)
   KuRmat.Clear();
   KuRmat.Add(-1.0, KUmat);
   KuRmat.Add(  k1, Rmat);
+
+  PRINT_INFO(100);
 
   delete T;
   T = NULL; // re-compute T on the next ImplicitSolve
