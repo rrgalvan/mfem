@@ -80,7 +80,7 @@ protected:
 public:
   KellerSegelOperator(FiniteElementSpace &f, FiniteElementSpace &g_f,
 		      double k0_, double k1_, double k2_, double k3_, double k4_,
-		      const GridFunction &u, const GridFunction &v);
+		      const Vector &u, const Vector &v);
 
   virtual void Mult(const Vector &uv, Vector &duv_dt) const;
   /** Solve the Backward-Euler equation: k = f(u + dt*k, t), for the unknown k.
@@ -88,7 +88,7 @@ public:
   virtual void ImplicitSolve(const double dt, const Vector &uv, Vector &duv_dt);
 
   /// Update the matrix KuRmat using the gradient of v
-  void SetParameters(const GridFunction &u, const GridFunction &v);
+  void SetParameters(const Vector &u, const Vector &v);
 
   virtual ~KellerSegelOperator();
 };
@@ -105,7 +105,7 @@ int main(int argc, char *argv[])
   int ode_solver_type = 3; //11; //3;
   double t_final = 0.5;
   double dt = 1.0e-2;
-  double k0 = 10.0;
+  double k0 = 1.0;
   double k1 = 1.0;
   double k2 = 1.0;
   double k3 = 1.0;
@@ -202,18 +202,34 @@ int main(int argc, char *argv[])
   H1_FECollection fe_coll(order, dim);
   FiniteElementSpace fespace(mesh, &fe_coll);
 
-  int fe_size = fespace.GetTrueVSize();
-  cout << "Number of u/v unknowns: " << fe_size << endl;
+  //  Define the BlockStructure of the problem, i.e. define the array of
+  // offsets for each variable. The last component of the Array is the sum
+  //  of the dimensions of each block.
+  Array<int> block_offsets(3); // number of variables + 1
+  block_offsets[0] = 0;
+  block_offsets[1] = fespace.GetVSize();
+  block_offsets[2] = fespace.GetVSize();
+  block_offsets.PartialSum();
 
-  Array<int> fe_offset(3);
-  fe_offset[0] = 0;
-  fe_offset[1] = fe_size;
-  fe_offset[2] = 2*fe_size;
+  std::cout << "***********************************************************\n";
+  std::cout << "dim(Vh) = " << block_offsets[1] - block_offsets[0] << "\n";
+  std::cout << "dim(Qh) = " << block_offsets[2] - block_offsets[1] << "\n";
+  std::cout << "dim(Vh+Qh) = " << block_offsets.Last() << "\n";
+  std::cout << "***********************************************************\n";
 
-  BlockVector uv(fe_offset);
-  GridFunction u, v;
-  u.MakeRef(&fespace, uv.GetBlock(0), 0);
-  v.MakeRef(&fespace, uv.GetBlock(1), 0);
+  // 7. Allocate memory in uv for the analytical solution.  Define the GridFunction u,p for the finite
+  //    element solution and linear form fform or the right hand
+  //    side. The data allocated by x and rhs are passed as a
+  //    reference to the grid functions (u,p) and the linear form
+  //    form fform.
+  BlockVector uv(block_offsets);
+
+  Vector u, v;
+  uv.GetBlockView(0, u);
+  uv.GetBlockView(1, v);
+
+  GridFunction u_gf(&fespace);
+  GridFunction v_gf(&fespace);
 
   // Define also the vector finite element space representing the
   // gradient of v
@@ -223,18 +239,20 @@ int main(int argc, char *argv[])
   // 5. Set the initial conditions for u. All boundaries are considered
   //    natural.
   FunctionCoefficient u_0(InitialU);
-  u.ProjectCoefficient(u_0);
-
+  u_gf.ProjectCoefficient(u_0);
+  u_gf.GetTrueDofs(u);
   FunctionCoefficient v_0(InitialV);
-  v.ProjectCoefficient(v_0);
+  v_gf.ProjectCoefficient(v_0);
+  v_gf.GetTrueDofs(v);
 
   // 6. Visualize initial data
-  socketstream sout;
+  socketstream u_sock, v_sock;
   if (visualization)
     {
       int  visport   = 19916;
-      sout.open(vishost, visport);
-      if (!sout)
+      u_sock.open(vishost, visport);
+      v_sock.open(vishost, visport);
+      if (!u_sock || !v_sock)
 	{
 	  cout << "Unable to connect to GLVis server at "
 	       << vishost << ':' << visport << endl;
@@ -243,12 +261,17 @@ int main(int argc, char *argv[])
 	}
       else
 	{
-	  sout.precision(precision);
-	  sout << "solution\n" << *mesh << u;
-	  sout << "pause\n";
-	  sout << flush;
+	  u_sock.precision(precision);
+	  u_sock << "solution\n" << *mesh << u_gf << "window_title 'u'" << endl;
+	  u_sock << "pause\n";
+	  u_sock << flush;
 	  cout << "GLVis visualization paused."
 	       << " Press space (in the GLVis window) to resume it.\n";
+
+	  v_sock.precision(precision);
+	  v_sock << "solution\n" << *mesh << v_gf << "window_title 'v'" << endl;
+	  v_sock << "pause\n";
+	  v_sock << flush;
 	}
     }
 
@@ -279,11 +302,13 @@ int main(int argc, char *argv[])
 	{
 	  cout << "step " << ti << ", t = " << t << endl;
 
+	  u_gf.SetFromTrueDofs(u);
+	  v_gf.SetFromTrueDofs(v);
 	  if (visualization)
 	    {
-	      sout << "solution\n" << *mesh << u << flush;
+	      u_sock << "solution\n" << *mesh << u_gf << "window_title 'u'" << endl << flush;
+	      v_sock << "solution\n" << *mesh << v_gf << "window_title 'v'" << endl << flush;
 	    }
-
 	  // if (visit)
 	  //   {
 	  //     visit_dc.SetCycle(ti);
@@ -291,8 +316,6 @@ int main(int argc, char *argv[])
 	  //     visit_dc.Save();
 	  //   }
 	}
-
-      PRINT_INFO(1003);
 
       oper.SetParameters(u,v);
       PRINT_INFO(1004);
@@ -308,9 +331,9 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
 					 FiniteElementSpace &g_f,
 					 double k0_, double k1_, double k2_,
 					 double k3_, double k4_,
-					 const GridFunction& u,
-					 const GridFunction& v)
-  : TimeDependentOperator(f.GetTrueVSize(), 0.0),
+					 const Vector& u,
+					 const Vector& v)
+  : TimeDependentOperator(2*f.GetTrueVSize(), 0.0),
     fespace(f), grad_fespace(g_f),
     M(NULL), K_u(NULL), K_v(NULL), R(NULL), G(NULL), T(NULL),
     current_dt(0.0), z(height)
@@ -352,18 +375,18 @@ KellerSegelOperator::KellerSegelOperator(FiniteElementSpace &f,
   // G->Finalize();
   // // G->FormSystemMatrix(ess_tdof_list, Gmat);
 
-  PRINT_INFO(2)
+  PRINT_INFO(2);
 
-  T_solver.iterative_mode = false;
+    T_solver.iterative_mode = false;
   T_solver.SetRelTol(rel_tol);
   T_solver.SetAbsTol(0.0);
   T_solver.SetMaxIter(100);
   T_solver.SetPrintLevel(0);
   T_solver.SetPreconditioner(T_prec);
 
-  PRINT_INFO(3)
+  PRINT_INFO(3);
 
-  SetParameters(u, v);
+    SetParameters(u, v);
 
   PRINT_INFO(300);
 } // END KellerSegelOperator::KellerSegelOperator()
@@ -385,10 +408,10 @@ void KellerSegelOperator::Mult(const Vector &uv, Vector &duv_dt) const
   z.Neg(); // DELETE?
   M_solver.Mult(z, du_dt);
 
-  // // Compute: dv/dt = M^{-1}( -K_v v + S(u^m,v^m) )
-  // KVmat.Mult(v, z);
-  // z.Neg(); // z = -z
-  // M_solver.Mult(z, dv_dt);
+  // Compute: dv/dt = M^{-1}( -K_v v + S(u^m,v^m) )
+  KVmat.Mult(v, z);
+  z.Neg(); // z = -z
+  M_solver.Mult(z, dv_dt);
 
   // TODO: TENER EN CUENTA S(u^m,v^m) !!!
 }
@@ -422,23 +445,23 @@ void KellerSegelOperator::ImplicitSolve(const double dt,
   z.Neg();
   T_solver.Mult(z, du_dt);
 
-  // // Solve the equation:
-  // //    dv_dt = M^{-1}*[ -K_v (v + dt*dv_dt) + S(u^m,v^m) )]
-  // // for dv_dt
-  // delete T;
-  // T = Add(1.0, Mmat, dt, KVmat);
-  // current_dt = dt;
-  // T_solver.SetOperator(*T);
-  // MFEM_VERIFY(dt == current_dt, ""); // SDIRK methods use the same dt
+  // Solve the equation:
+  //    dv_dt = M^{-1}*[ -K_v (v + dt*dv_dt) + S(u^m,v^m) )]
+  // for dv_dt
+  delete T;
+  T = Add(1.0, Mmat, dt, KVmat);
+  current_dt = dt;
+  T_solver.SetOperator(*T);
+  MFEM_VERIFY(dt == current_dt, ""); // SDIRK methods use the same dt
 
-  // KVmat.Mult(v, z);
-  // z.Neg();
-  // T_solver.Mult(z, dv_dt);
+  KVmat.Mult(v, z);
+  z.Neg();
+  T_solver.Mult(z, dv_dt);
 
   // TODO: TENER EN CUENTA S(u^m,v^m) !!!
 }
 
-void KellerSegelOperator::SetParameters(const GridFunction &u, const GridFunction &v)
+void KellerSegelOperator::SetParameters(const Vector &u, const Vector &v)
 {
   // // Compute gradient of v
   // Vector grad_v( grad_fespace.GetTrueVSize() );
